@@ -1,4 +1,3 @@
-cat > pardus25-simes-auto.sh << 'SCRIPT_EOF'
 #!/usr/bin/env bash
 # simes-pcsc-fix — SiMES (2.6.7 / 3.2.0) Pardus 25 PC/SC uyumluluk onarimi.
 # v3.2.0-3: ev dizininde SimesIstemci yoksa VARSAYILAN eylem = kurulum.
@@ -740,6 +739,3 @@ exit "$rc"
 #BAAAnggAABQAAAAAAAAAAAAAAAAA+gAAAFNpbWVzUGNzY0FnZW50LmNsYXNzUEsFBgAAAAADAAMA
 #vwAAAOMFAAAAAA==
 #@@EMBED-AGENT-END@@
-SCRIPT_EOF
-chmod +x pardus25-simes-auto.sh
-bash -n pardus25-simes-auto.sh && echo "SYNTAX OK"
