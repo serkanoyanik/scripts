@@ -1,4 +1,4 @@
-# pardus25-simes-fix (simes-pcsc-fix)
+# pardus25-simes-auto 
 
 Pardus 25 üzerinde **SiMES e-imza istemcisinin (2.6.7 / 3.2.0) akıllı kart okuyucuyu
 görememesi** sorununu onaran betik.
@@ -21,9 +21,8 @@ görememesi** sorununu onaran betik.
 ## Hızlı başlangıç
 
 ```bash
-sudo ./pardus25-simes-fix.sh          # tüm kurulumları onar
-./pardus25-simes-fix.sh --check       # yalnızca durum raporu
-./pardus25-simes-fix.sh --install     # kurulum yoksa indir + kur
+./pardus25-simes-auto.sh              # Varsayılan eylem kurulum oldu
+
 
 (secenek yok)     Tum kullanicilardaki SiMES kurulumlarini onar (akia+pcscd dahil)
 --check           Onarim gerekip gerekmedigini soyle (yazmaz)
