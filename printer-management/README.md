@@ -1,4 +1,4 @@
-# Yazıcı Yönetimi (yazici-yonetimi.sh)
+# Yazıcı Yönetimi
 
 Debian 13 ve TÜBİTAK Pardus 25 için menü tabanlı yazıcı yönetim scripti.
 Ağ yazıcılarının otomatik eklenmesini ve yazdırma iletişim kutusunda görünmesini
