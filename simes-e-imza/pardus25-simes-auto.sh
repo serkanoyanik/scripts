@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# simes-pcsc-fix — SiMES (2.6.7 / 3.2.0) Pardus 25 PC/SC uyumluluk onarimi.
-# v3.2.0-3: ev dizininde SimesIstemci yoksa VARSAYILAN eylem = kurulum.
-#           Coklu kullanici tespiti, sistem katmani bir kez, sahiplik koruma,
-#           arsiv dogrulama, portal bekleme, resume, tek satir ilerleme.
+# simes-pcsc-fix — SiMES (2.6.7 / 3.2.0) Pardus 25 PC/SC uyumluluk onarımı.
+# v3.2.0-4: YALNIZCA Pardus 25. İki katmanlı mimari:
+#   Kullanıcı katmanı (sudo gerekmez): SimesIstemci kurulumu + vmoptions + ajan
+#   Sistem katmanı (root, makine basina BİR KEZ): akia, unzip, wget/curl, pcscd
+# Ev dizininde SimesIstemci yoksa VARSAYILAN eylem = kurulum.
 set -u
 umask 022
-VERSION="3.2.0-3"
+VERSION="3.2.0-4"
 MARKER="# simes-pcsc-fix: Pardus 25 libpcsclite.so.1 uyumlulugu - kaldirmak icin: simes-pcsc-fix --revert"
 PROP_PREFIX="-Dsun.security.smartcardio.library="
 PROP_KEY="sun.security.smartcardio.library"
@@ -26,6 +27,8 @@ TARGET_DIR=""
 ALL=0
 BOOTSTRAP=0
 SYSTEM_LAYER_DONE=0
+SYSTEM_MISSING=""
+SYSTEM_STRICT="${SIMES_REQUIRE_SYSTEM:-0}"
 log()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 err()  { printf '%s\n' "$*" >&2; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -33,41 +36,85 @@ usage() {
 local n="${0##*/}"
 cat <<EOF
 Kullanim: $n [SECENEK]
-(secenek yok)     Ev dizininde SimesIstemci yoksa KURAR, varsa onarir (akia+pcscd dahil)
---check           Onarim gerekip gerekmedigini soyle (yazmaz, kurmaz)
---revert          Eklenen satirlari ve ajani kaldir
---verify          SiMES'in kendi kodu okuyucuyu goruyor mu (teshis)
---install         Kurulumu acikca tetikle (varsayilan zaten kurulum)
---dir YOL         Yalnizca bu kurulum dizinini isle
---all             Tum kullanicilari isle (root)
---no-deps         akia/pcscd kontrolunu atla
---quiet           Yalnizca hata bas
---version         Surum
---help            Bu metin
-Cikis kodlari: 0 basarili, 1 onarim gerekli/okuyucu yok, 2 hata.
+(secenek yok)     Ev dizininde SimesIstemci yoksa KURAR, varsa onarır
+--system-setup    SISTEM katmanini hazirla (root, makine başına BİR KEZ)
+--check           Onarım gerekip gerekmediğini söyle (yazmaz, kurmaz)
+--revert          Eklenen satırları ve ajani kaldır
+--verify          SiMES'in kendi kodu okuyucuyu görüyor mu (teşhis)
+--install         Kurulumu açıkça tetikle (varsayılan zaten kurulum)
+--dir YOL         Yalnızca bu kurulum dizinini işle
+--all             Tum kullanıcıları işle (root)
+--no-deps         akia/pcscd kontrolünü atla
+--quiet           Yalnızca hata bas
+--version         Sürüm
+--help            Yardım komutları
+
+Katmanlar:
+  Kullanici (sudo gerekmez): SimesIstemci kurulumu, vmoptions, ajan
+  Sistem (root, bir kez)   : akia, unzip, wget/curl, pcscd  -> --system-setup
+
+Ortam degiskenleri:
+  SIMES_REQUIRE_SYSTEM=1    Sistem katmani eksikse islemi durdur (kati kip)
+  SIMES_AUTH_TRIES=60       Kurumsal portal bekleme deneme sayisi (x5 sn)
+  SIMES_PCSC_FIX_LIB, SIMES_PCSC_FIX_AKIA_LIB, SIMES_PCSC_FIX_AGENT_JAR
+
+Cikis kodlari: 0 basarili, 1 onarim gerekli/eksik katman, 2 hata.
+Yalnizca Pardus 25.x'te calisir; diger surumlerde hicbir dosya degistirilmez.
 EOF
 }
 while [ $# -gt 0 ]; do
 case "$1" in
---check)   MODE="check" ;;
---revert)  MODE="revert" ;;
---verify)  MODE="verify" ;;
---install) BOOTSTRAP=1 ;;
---all)     ALL=1 ;;
---no-deps) NO_DEPS=1 ;;
---quiet)   QUIET=1 ;;
+--check)        MODE="check" ;;
+--revert)       MODE="revert" ;;
+--verify)       MODE="verify" ;;
+--system-setup) MODE="system" ;;
+--install)      BOOTSTRAP=1 ;;
+--all)          ALL=1 ;;
+--no-deps)      NO_DEPS=1 ;;
+--quiet)        QUIET=1 ;;
 --version) printf '%s %s\n' "${0##*/}" "$VERSION"; exit 0 ;;
 --help|-h) usage; exit 0 ;;
 --dir)
 [ $# -ge 2 ] || { err "--dir bir yol ister"; exit 2; }
 TARGET_DIR="$2"; shift ;;
-*) err "Bilinmeyen arguman: $1"; usage >&2; exit 2 ;;
+*) err "Bilinmeyen argüman: $1"; usage >&2; exit 2 ;;
 esac
 shift
 done
 : "${NO_DEPS:=0}"
 # --------------------------------------------------------------------------
-# PC/SC kutuphanesi ve ajan dosyasi
+# ;İşletim sistemi kilidi: YALNIZCA Pardus 25.x
+# --------------------------------------------------------------------------
+check_os() {
+local id ver ad
+[ -r /etc/os-release ] || { err "/etc/os-release okunamadı; sistem doğrulanamadı."; exit 2; }
+. /etc/os-release
+id="${ID:-}"; ver="${VERSION_ID:-}"; ad="${PRETTY_NAME:-$id}"
+case "$id" in
+pardus) ;;
+*)
+case "$ad" in
+*[Pp]ardus*) ;;
+*)
+err "Bu betik yalnızca Pardus 25 içindir. Tespit edilen: ${ad:-bilinmiyor}"
+err "İşlem durduruldu; hiçbir dosya değiştirilmedi."
+exit 2 ;;
+esac ;;
+esac
+case "$ver" in
+25|25.*) log "İşletim sistemi: ${ad:-Pardus $ver}" ;;
+*)
+err "Bu betik yalnızca Pardus 25.x icin tasarlanmıştır."
+err "Tespit edilen sürüm: ${ver:-bilinmiyor} (${ad:-bilinmiyor})"
+err "Pardus 23'te PC/SC paketleri zaten uyumludur; bu betiğe gerek yoktur."
+err "Çalıştırılması mevcut çalışan ayarları bozabilir."
+err "İşlem durduruldu; hiçbir dosya değiştirilmedi."
+exit 2 ;;
+esac
+}
+check_os
+# --------------------------------------------------------------------------
+# PC/SC kütüphanesi ve ajan dosyası
 # --------------------------------------------------------------------------
 multiarch_dir() {
 local a
@@ -88,13 +135,13 @@ lib_path() {
 local ma cand
 if [ -n "${SIMES_PCSC_FIX_LIB:-}" ]; then
 if [ -e "$SIMES_PCSC_FIX_LIB" ]; then printf '%s\n' "$SIMES_PCSC_FIX_LIB"; return 0; fi
-err "libpcsclite.so.1 bulunamadi: $SIMES_PCSC_FIX_LIB"; return 2
+err "libpcsclite.so.1 bulunamadı: $SIMES_PCSC_FIX_LIB"; return 2
 fi
 ma="$(multiarch_dir)"
 for cand in "/usr/lib/$ma/libpcsclite.so.1" "/lib/$ma/libpcsclite.so.1" "/usr/lib64/libpcsclite.so.1" "/usr/lib/libpcsclite.so.1"; do
 if [ -e "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
 done
-err "libpcsclite.so.1 bulunamadi (pcsc suruculeri kurulu mu?)"
+err "libpcsclite.so.1 bulunamadı (pcsc sürücüleri kurulu mu?)"
 return 2
 }
 AGENT_SRC=""
@@ -103,12 +150,12 @@ cleanup_agent_tmp() { [ -n "$AGENT_TMP" ] && rm -f -- "$AGENT_TMP"; return 0; }
 trap cleanup_agent_tmp EXIT
 extract_embedded_agent() {
 local tmp
-command -v base64 >/dev/null 2>&1 || { err "base64 bulunamadi"; return 1; }
-tmp="$(mktemp "${TMPDIR:-/tmp}/simes-pcsc-agent.XXXXXX")" || { err "gecici dosya acilamadi"; return 1; }
+command -v base64 >/dev/null 2>&1 || { err "base64 bulunamadı"; return 1; }
+tmp="$(mktemp "${TMPDIR:-/tmp}/simes-pcsc-agent.XXXXXX")" || { err "geçici dosya açılamadı"; return 1; }
 if ! awk -v b="$EMBED_BEGIN" -v e="$EMBED_END" '$0==b{on=1;next}$0==e{on=0}on{sub(/^#/,"");print}' "$SELF" | base64 -d > "$tmp" 2>/dev/null; then
-rm -f -- "$tmp"; err "gomulu ajan cikarilamadi"; return 1
+rm -f -- "$tmp"; err "gömülü ajan çıkarılamadı"; return 1
 fi
-if [ "$(head -c2 -- "$tmp" 2>/dev/null)" != "PK" ]; then rm -f -- "$tmp"; err "gomulu ajan gecersiz"; return 1; fi
+if [ "$(head -c2 -- "$tmp" 2>/dev/null)" != "PK" ]; then rm -f -- "$tmp"; err "gömülü ajan gecersiz"; return 1; fi
 chmod 0644 "$tmp" 2>/dev/null || true
 AGENT_TMP="$tmp"; AGENT_SRC="$tmp"; return 0
 }
@@ -126,7 +173,7 @@ done
 extract_embedded_agent
 }
 # --------------------------------------------------------------------------
-# akia + pcscd (sistem katmani)
+# Sistem katmani: akia + pcscd + unzip + indirici
 # --------------------------------------------------------------------------
 AKIA_PKG="akia"
 AKIA_LIB="/usr/lib/libakisp11.so"
@@ -143,7 +190,7 @@ else printf 'broken\n'; fi
 }
 akia_state_text() {
 case "$1" in
-ok) printf 'kurulu ve saglam\n' ;;
+ok) printf 'kurulu ve sağlam\n' ;;
 missing) printf 'kurulu degil\n' ;;
 broken) printf 'kurulu ama %s eksik/bozuk\n' "$AKIA_LIB" ;;
 *) printf 'bilinmiyor\n' ;;
@@ -155,29 +202,43 @@ elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo -n "
 else return 127; fi
 }
 apt_hint() {
-if [ "$1" = "reinstall" ]; then err "Elle: sudo apt update && sudo apt install --reinstall $AKIA_PKG"
-else err "Elle: sudo apt update && sudo apt install $AKIA_PKG"; fi
+err "Yönetici bu makinede BİR KEZ bu komutla çalıştırmalı: sudo $0 --system-setup"
+if [ "$1" = "reinstall" ]; then
+err "veya elle: sudo apt update && sudo apt install --reinstall $AKIA_PKG çalıştırmalı"
+else
+err "veya elle: sudo apt update && sudo apt install $AKIA_PKG çalıştırmalı"
+fi
 }
+# DIKKAT: rc, komuttan HEMEN sonra yakalanır. if/fi sonrası $? daima 0'dir.
 apt_fix_akia() {
 local mode="$1" rc
 local -a args=(install -y)
 [ "$mode" = "reinstall" ] && args+=(--reinstall)
 args+=("$AKIA_PKG")
-if DEBIAN_FRONTEND=noninteractive apt_run apt-get "${args[@]}" </dev/null >/dev/null 2>&1; then return 0; fi
+DEBIAN_FRONTEND=noninteractive apt_run apt-get "${args[@]}" </dev/null >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 127 ] && { err "akia: root yetkisi gerekiyor"; apt_hint "$mode"; return 2; }
+[ "$rc" -eq 0 ] && return 0
+if [ "$rc" -eq 127 ]; then
+err "akia: kurulum için root yetkisi gerekiyor"
+apt_hint "$mode"; return 2
+fi
 log "akia: apt update..."
 DEBIAN_FRONTEND=noninteractive apt_run apt-get update </dev/null >/dev/null 2>&1 || err "akia: apt update basarisiz"
-if DEBIAN_FRONTEND=noninteractive apt_run apt-get "${args[@]}" </dev/null >/dev/null 2>&1; then return 0; fi
+DEBIAN_FRONTEND=noninteractive apt_run apt-get "${args[@]}" </dev/null >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 127 ] && { err "akia: root yetkisi gerekiyor"; apt_hint "$mode"; return 2; }
-err "akia: kurulum basarisiz (cikis $rc)"; apt_hint "$mode"; return 1
+[ "$rc" -eq 0 ] && return 0
+if [ "$rc" -eq 127 ]; then
+err "akia: kurulum için root yetkisi gerekiyor (parolasız sudo yok)"
+apt_hint "$mode"; return 2
+fi
+err "akia: kurulum basarısız (apt-get cikis $rc)"
+apt_hint "$mode"; return 1
 }
 ensure_akia() {
 local st
 st="$(akia_state)"
 case "$st" in
-ok) log "akia: kurulu ve saglam"; return 0 ;;
+ok) log "akia: kurulu ve sağlam"; return 0 ;;
 missing) log "akia: kuruluyor..."; apt_fix_akia install || return $? ;;
 broken) log "akia: yeniden kuruluyor..."; apt_fix_akia reinstall || return $? ;;
 esac
@@ -193,12 +254,51 @@ systemctl start pcscd.socket 2>/dev/null || systemctl start pcscd.service 2>/dev
 fi
 return 0
 }
+# Sistem katmanı bir kez çalışır; yetki yoksa KULLANICI katmanını bloke etmez.
 ensure_system_layer() {
 [ "$SYSTEM_LAYER_DONE" -eq 1 ] && return 0
 SYSTEM_LAYER_DONE=1
-if [ "$NO_DEPS" -eq 0 ]; then ensure_akia || return 2; fi
+if [ "$NO_DEPS" -eq 0 ]; then
+if ! ensure_akia; then
+SYSTEM_MISSING="akia"
+[ "$SYSTEM_STRICT" -eq 1 ] && return 2
+warn "Sistem katmanı eksik: akia (kurulum için root yetkisi gerekiyor)."
+warn "Kullanıcı katmanı işlemine devam ediliyor; akia olmadan kart okunamaz."
+warn "Yönetici bu makinede BİR KEZ bu komutla çalıştırmalı: sudo $0 --system-setup"
+fi
+fi
 ensure_pcscd
 return 0
+}
+# Yönetici modu: makine başına bir kez
+system_setup() {
+local rc=0
+if [ "$(id -u)" -ne 0 ]; then
+err "--system-setup root yetkisi gerektirir."
+err "Yönetici olarak çalıştırın: sudo $0 --system-setup"
+return 2
+fi
+log "Sistem katmanı hazirlanıyor (akia, unzip, indirici, pcscd)..."
+ensure_akia || rc=2
+if command -v unzip >/dev/null 2>&1; then
+log "unzip: kurulu"
+else
+log "unzip kuruluyor..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y unzip </dev/null >/dev/null 2>&1 || { err "unzip kurulamadı"; rc=2; }
+fi
+if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
+log "indirici: kurulu"
+else
+log "wget/curl kuruluyor..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl ca-certificates </dev/null >/dev/null 2>&1 || { err "indirici kurulamadı"; rc=2; }
+fi
+ensure_pcscd
+if [ "$rc" -eq 0 ]; then
+log "Sistem katmanı hazır. Artık her kullanıcı betiği sudo'suz çalıştırabilir."
+else
+err "Sistem katmanı tamamlanamadı (cikis $rc)."
+fi
+return "$rc"
 }
 # --------------------------------------------------------------------------
 # Kurulum tespiti
@@ -285,7 +385,7 @@ rm -f "$list"
 [ "$found" -eq 1 ]
 }
 # --------------------------------------------------------------------------
-# Onarim
+# Onarım
 # --------------------------------------------------------------------------
 prop_value() {
 local vmo="$1" line
@@ -332,27 +432,27 @@ do_check() {
 local d="$1" state astate
 if [ "$NO_DEPS" -eq 0 ]; then
 astate="$(akia_state)"
-[ "$astate" = "ok" ] && log "akia: kurulu ve saglam" || log "akia: $(akia_state_text "$astate") -> onarim gerekli"
+[ "$astate" = "ok" ] && log "akia: kurulu ve sağlam" || log "akia: $(akia_state_text "$astate") -> sistem katmanı gerekli"
 fi
 state="$(full_state "$d")" || return 2
 case "$state" in
-ok) log "$d: onarili"; { [ "$NO_DEPS" -eq 1 ] || [ "$astate" = "ok" ]; } || return 1; return 0 ;;
-vendor-bad) err "Satici ${PROP_KEY} satiri var ama dosya yok: $(vmo_path "$d")"; return 1 ;;
-none|ours-bad) log "$d: onarim-gerekli"; return 1 ;;
+ok) log "$d: onarılı"; { [ "$NO_DEPS" -eq 1 ] || [ "$astate" = "ok" ]; } || return 1; return 0 ;;
+vendor-bad) err "Satıcı ${PROP_KEY} satırı var ama dosya yok: $(vmo_path "$d")"; return 1 ;;
+none|ours-bad) log "$d: onarım-gerekli"; return 1 ;;
 esac
 return 2
 }
 install_agent() {
 local d="$1" vmo src dst tmp
 vmo="$(vmo_path "$d")"; dst="$d/$AGENT_JAR_NAME"
-resolve_agent_jar || { err "simes-pcsc-agent.jar bulunamadi"; return 2; }
+resolve_agent_jar || { err "simes-pcsc-agent.jar bulunamadı"; return 2; }
 src="$AGENT_SRC"
 [ -f "$dst" ] && cmp -s -- "$src" "$dst" && return 0
-tmp="$(mktemp "$d/.simes-pcsc-agent.XXXXXX")" || { err "ajan yazilamadi: $d"; return 2; }
-cp -- "$src" "$tmp" || { rm -f "$tmp"; err "ajan yazilamadi: $d"; return 2; }
+tmp="$(mktemp "$d/.simes-pcsc-agent.XXXXXX")" || { err "ajan yazılamadı: $d"; return 2; }
+cp -- "$src" "$tmp" || { rm -f "$tmp"; err "ajan yazılamadı: $d"; return 2; }
 chmod 0644 "$tmp" 2>/dev/null || true
 chown --reference="$vmo" "$tmp" 2>/dev/null || true
-mv -f -- "$tmp" "$dst" || { rm -f "$tmp"; err "ajan yazilamadi: $d"; return 2; }
+mv -f -- "$tmp" "$dst" || { rm -f "$tmp"; err "ajan yazılamadı: $d"; return 2; }
 [ "$(id -u)" -eq 0 ] && chown --reference="$d" "$dst" 2>/dev/null || true
 return 0
 }
@@ -377,13 +477,13 @@ lib="$(lib_path)" || return 2
 state="$(full_state "$d")" || return 2
 ensure_system_layer || return 2
 case "$state" in
-ok) log "$d: zaten onarili"; return 0 ;;
-vendor-bad) err "Satici ${PROP_KEY} satiri bulundu, dokunulmadi: $vmo"; return 0 ;;
+ok) log "$d: zaten onarılı"; return 0 ;;
+vendor-bad) err "Satıcı ${PROP_KEY} satırı bulundu, dokunulmadı: $vmo"; return 0 ;;
 esac
-[ -f "$vmo" ] && [ ! -w "$vmo" ] && { err "vmoptions yazilamadi: $vmo"; return 2; }
-[ ! -w "$d" ] && { err "kurulum dizinine yazilamadi: $d"; return 2; }
+[ -f "$vmo" ] && [ ! -w "$vmo" ] && { err "vmoptions yazılamadı: $vmo"; return 2; }
+[ ! -w "$d" ] && { err "kurulum dizinine yazılamadı: $d"; return 2; }
 install_agent "$d" || return 2
-tmp="$(mktemp "$(dirname "$vmo")/.simes-pcsc-fix.XXXXXX")" || { err "vmoptions yazilamadi: $vmo"; return 2; }
+tmp="$(mktemp "$(dirname "$vmo")/.simes-pcsc-fix.XXXXXX")" || { err "vmoptions yazılamadı: $vmo"; return 2; }
 set_eol "$vmo"; eol="$EOL"
 strip_our_block "$vmo" "$tmp" "$eol"
 if [ -s "$tmp" ] && [ "$(tail -c1 "$tmp" | od -An -tx1 | tr -d ' \n')" != "0a" ]; then printf '%s' "$eol" >> "$tmp"; fi
@@ -393,10 +493,10 @@ printf '%s%s%s' "$AGENT_LIB_PREFIX" "$lib" "$eol" >> "$tmp"
 printf '%s%s' "$AGENT_ARG" "$eol" >> "$tmp"
 chmod --reference="$vmo" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
 chown --reference="$vmo" "$tmp" 2>/dev/null || true
-mv -f -- "$tmp" "$vmo" || { rm -f "$tmp"; err "vmoptions yazilamadi: $vmo"; return 2; }
+mv -f -- "$tmp" "$vmo" || { rm -f "$tmp"; err "vmoptions yazılamadı: $vmo"; return 2; }
 [ "$(id -u)" -eq 0 ] && chown --reference="$d" "$vmo" 2>/dev/null || true
-log "$d: onarildi (sahibi: $(install_owner "$d"))"
-log "  SiMES calisiyorsa kapatip yeniden acin."
+log "$d: onarıldı (sahibi: $(install_owner "$d"))"
+log "  SiMES çalışıyorsa kapatıp yeniden açın."
 return 0
 }
 has_marker() { awk -v m="$MARKER" '{sub(/\r$/,"")} $0==m{f=1;exit} END{exit(f?0:1)}' "$1"; }
@@ -404,20 +504,20 @@ do_revert() {
 local d="$1" vmo tmp eol had_marker=0
 vmo="$(vmo_path "$d")"
 [ -f "$vmo" ] && has_marker "$vmo" && had_marker=1
-[ "$had_marker" -eq 0 ] && [ ! -f "$d/$AGENT_JAR_NAME" ] && { log "$d: kaldirilacak satir yok"; return 0; }
-[ -f "$vmo" ] && [ ! -w "$vmo" ] && { err "vmoptions yazilamadi: $vmo"; return 2; }
+[ "$had_marker" -eq 0 ] && [ ! -f "$d/$AGENT_JAR_NAME" ] && { log "$d: kaldırılacak satır yok"; return 0; }
+[ -f "$vmo" ] && [ ! -w "$vmo" ] && { err "vmoptions yazılamadı: $vmo"; return 2; }
 if [ "$had_marker" -eq 1 ]; then
-tmp="$(mktemp "$(dirname "$vmo")/.simes-pcsc-fix.XXXXXX")" || { err "vmoptions yazilamadi"; return 2; }
+tmp="$(mktemp "$(dirname "$vmo")/.simes-pcsc-fix.XXXXXX")" || { err "vmoptions yazılamadı"; return 2; }
 set_eol "$vmo"; eol="$EOL"
 strip_our_block "$vmo" "$tmp" "$eol"
 chmod --reference="$vmo" "$tmp" 2>/dev/null || chmod 0600 "$tmp" 2>/dev/null || true
 chown --reference="$vmo" "$tmp" 2>/dev/null || true
-mv -f -- "$tmp" "$vmo" || { rm -f "$tmp"; err "vmoptions yazilamadi"; return 2; }
+mv -f -- "$tmp" "$vmo" || { rm -f "$tmp"; err "vmoptions yazilamadı"; return 2; }
 [ "$(id -u)" -eq 0 ] && chown --reference="$d" "$vmo" 2>/dev/null || true
 [ ! -s "$vmo" ] && rm -f -- "$vmo" || true
 fi
-if [ -f "$d/$AGENT_JAR_NAME" ]; then rm -f -- "$d/$AGENT_JAR_NAME" || { err "ajan kaldirilamadi"; return 2; }; fi
-log "$d: satirlar kaldirildi"
+if [ -f "$d/$AGENT_JAR_NAME" ]; then rm -f -- "$d/$AGENT_JAR_NAME" || { err "ajan kaldırılamadı"; return 2; }; fi
+log "$d: satırlar kaldırıldı"
 return 0
 }
 verify_classes() {
@@ -430,24 +530,24 @@ local d="$1" out rc classes prop errout errfile
 local -a jvm_args=()
 [ -x "$d/jre/bin/java" ] || { err "java yok: $d/jre/bin/java"; return 2; }
 [ -f "$d/simes-desktop-agent.jar" ] || { err "jar yok: $d/simes-desktop-agent.jar"; return 2; }
-if [ "$NO_DEPS" -eq 0 ] && [ "$(akia_state)" != "ok" ]; then err "uyari: akia $(akia_state_text "$(akia_state)")"; fi
+if [ "$NO_DEPS" -eq 0 ] && [ "$(akia_state)" != "ok" ]; then err "uyarı: akia $(akia_state_text "$(akia_state)")"; fi
 classes="$(verify_classes)"
 if agent_ok "$d"; then
 jvm_args+=("$AGENT_ARG"); jvm_args+=("-Dsun.security.smartcardio.library=$BARE_OVERRIDE")
 elif prop="$(prop_value "$(vmo_path "$d")")" && [ -n "$prop" ]; then
 jvm_args+=("-Dsun.security.smartcardio.library=$prop")
 fi
-errfile="$(mktemp "${TMPDIR:-/tmp}/simes-verify-err.XXXXXX")" || { err "gecici dosya acilamadi"; return 2; }
+errfile="$(mktemp "${TMPDIR:-/tmp}/simes-verify-err.XXXXXX")" || { err "geçici dosya açılamadı"; return 2; }
 out="$(cd "$d" && "$d/jre/bin/java" ${jvm_args[@]+"${jvm_args[@]}"} -cp "$classes:$d/simes-desktop-agent.jar" VerifyReaders 2>"$errfile")"
 rc=$?
 errout="$(cat -- "$errfile" 2>/dev/null)"; rm -f "$errfile"
 if [ "$rc" -eq 0 ]; then [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }; return 1; fi
-err "dogrulama calistirilamadi (java cikis $rc)${errout:+: $errout}"
+err "doğrulama çalıstırılamadı (java cikis $rc)${errout:+: $errout}"
 case "$errout" in *CardException*) err "ipucu: systemctl status pcscd.socket; pcsc_scan" ;; esac
 return 2
 }
 # --------------------------------------------------------------------------
-# Kurulum (bootstrap): dogrulama + portal bekleme + resume + tek satir ilerleme
+# Kurulum: doğrulama + portal bekleme + resume + tek satır ilerleme
 # --------------------------------------------------------------------------
 detect_simes_url() {
 local page url
@@ -467,17 +567,27 @@ is_zip_file() { [ "$(file_magic "$1")" = "504b0304" ]; }
 is_sh_file()  { [ "$(head -c2 -- "$1" 2>/dev/null)" = "#!" ]; }
 zip_ok()      { is_zip_file "$1" && unzip -tq -- "$1" >/dev/null 2>&1; }
 ensure_unzip() {
+local rc
 command -v unzip >/dev/null 2>&1 && return 0
 log "unzip kuruluyor..."
-if apt_run apt-get install -y unzip </dev/null >/dev/null 2>&1; then return 0; fi
-err "unzip gerekli: sudo apt update && sudo apt install unzip"
+DEBIAN_FRONTEND=noninteractive apt_run apt-get install -y unzip </dev/null >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && command -v unzip >/dev/null 2>&1 && return 0
+SYSTEM_MISSING="${SYSTEM_MISSING:+$SYSTEM_MISSING, }unzip"
+err "unzip gerekli ama kurulamadı (root yetkisi gerekiyor)."
+err "Yönetici bu makinede BİR KEZ bu komutla çalıştırılmalı: sudo $0 --system-setup"
 return 2
 }
 ensure_downloader() {
+local rc
 if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then return 0; fi
-log "wget/curl bulunamadi; kuruluyor..."
-if apt_run apt-get install -y wget curl ca-certificates </dev/null >/dev/null 2>&1; then return 0; fi
-err "Indirici yok: sudo apt update && sudo apt install -y wget curl ca-certificates"
+log "wget/curl bulunamadı; kuruluyor..."
+DEBIAN_FRONTEND=noninteractive apt_run apt-get install -y wget curl ca-certificates </dev/null >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && { command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; }; then return 0; fi
+SYSTEM_MISSING="${SYSTEM_MISSING:+$SYSTEM_MISSING, }indirici"
+err "İndirici (wget/curl) yok ve kurulamadı (root yetkisi gerekiyor)."
+err "Yönetici bu makinede BİR KEZ bu komutla çalıştırılmalı: sudo $0 --system-setup"
 return 2
 }
 net_ready() {
@@ -497,10 +607,10 @@ local url="$1" i=0 max="${SIMES_AUTH_TRIES:-60}"
 while ! net_ready "$url"; do
 i=$((i+1))
 if [ "$i" -gt "$max" ]; then
-err "Ag kimlik dogrulamasi zaman asimi. Tarayicida oturum acip tekrar calistirin."
+err "Ağ kimlik doğrulaması zaman aşımı. Tarayıcıda oturum açıp tekrar çalıştırın."
 return 2
 fi
-warn "Kurumsal ag kimlik dogrulamasi bekleniyor (deneme $i/$max). Tarayicida oturum acin..."
+warn "Kurumsal ağ kimlik doğrulaması bekleniyor (deneme $i/$max). Tarayıcıda oturum açın..."
 sleep 5
 done
 return 0
@@ -514,7 +624,7 @@ uh="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"; [ -z "$uh" ] && uh="$HOME"
 url="$(detect_simes_url)"; [ -z "$url" ] && url="$DEFAULT_SIMES_URL"
 log "Simes e-imza: guncel surum $url"
 dl="$uh/SimesKurulum"
-run_as_user "$u" mkdir -p "$dl" || { err "klasor olusturulamadi: $dl"; return 2; }
+run_as_user "$u" mkdir -p "$dl" || { err "klasor oluşturulamadı: $dl"; return 2; }
 zip="$dl/$(basename "$url")"
 ensure_unzip || return 2
 ensure_downloader || return 2
@@ -522,12 +632,12 @@ wait_for_auth "$url" || return 2
 resume=0
 if [ -s "$zip" ]; then
 if zip_ok "$zip"; then
-log "Simes e-imza: mevcut saglam arsiv kullanilacak: $zip"; resume=2
+log "Simes e-imza: mevcut sağlam arşiv kullanılacak: $zip"; resume=2
 elif is_zip_file "$zip"; then
-warn "Simes e-imza: yarim kalmis arsiv; kaldigi yerden devam edilecek."
+warn "Simes e-imza: yarım kalmış arşiv; kaldığı yerden devam edilecek."
 resume=1
 else
-warn "Simes e-imza: bozuk/HTML arsiv siliniyor."
+warn "Simes e-imza: bozuk/HTML arşiv siliniyor."
 rm -f -- "$zip"; resume=0
 fi
 fi
@@ -539,7 +649,7 @@ total="$(wget --spider -S "$url" 2>&1 | awk 'tolower($1)=="content-length:"{v=$2
 fi
 [ -z "$total" ] && total=0
 DL_LOG="$(mktemp "${TMPDIR:-/tmp}/simes-dl.XXXXXX")" || DL_LOG=/tmp/simes-dl.log
-log "Simes e-imza: indiriliyor... (tek satir ilerleme)"
+log "Simes e-imza: indiriliyor... "
 if command -v wget >/dev/null 2>&1; then
 run_as_user "$u" wget -c --tries=2 --timeout=30 --read-timeout=120 -O "$zip" "$url" >"$DL_LOG" 2>&1 &
 else
@@ -580,29 +690,29 @@ wait "$dpid"; rc=$?
 [ -t 1 ] && printf '\n'
 fsize=$(stat -c %s "$zip" 2>/dev/null || echo 0)
 if [ "$rc" -ne 0 ] || ! zip_ok "$zip"; then
-err "Simes e-imza: indirme basarisiz/eksik ($fsize bayt, rc=$rc)."
+err "Simes e-imza: indirme başarısız/eksik ($fsize bayt, rc=$rc)."
 err "--- indirme gunlugu (son 15 satir) ---"
 tail -n 15 "$DL_LOG" >&2 || true
-err "Cozum: zip'i tarayicidan indirip su yola kopyalayin: $zip"
+err "Çözüm: zip'i tarayıcıdan indirip şu yola kopyalayın: $zip"
 rm -f "$DL_LOG"
 return 2
 fi
 rm -f "$DL_LOG"
-log "Simes e-imza: indirme tamamlandi ($(numfmt --to=iec "$fsize" 2>/dev/null || echo "$fsize B"))."
+log "Simes e-imza: indirme tamamlandı ($(numfmt --to=iec "$fsize" 2>/dev/null || echo "$fsize B"))."
 fi
 if zip_ok "$zip"; then
-run_as_user "$u" bash -c "cd '$dl' && unzip -o -q '$(basename "$zip")'" || { err "cikarma basarisiz"; return 2; }
+run_as_user "$u" bash -c "cd '$dl' && unzip -o -q '$(basename "$zip")'" || { err "çıkarma başarısız"; return 2; }
 inst="$(find "$dl" -maxdepth 2 -type f -name '*.sh' 2>/dev/null | head -n1)"
 elif is_sh_file "$zip"; then
 inst="$zip"
 else
-err "Simes e-imza: arsiv gecersiz (zip veya kurulum betigi degil)."
+err "Simes e-imza: arşiv geçersiz (zip veya kurulum betiği değil)."
 return 2
 fi
-[ -z "$inst" ] && { err "kurulum scripti bulunamadi"; return 2; }
+[ -z "$inst" ] && { err "kurulum scripti bulunamadı"; return 2; }
 chmod +x "$inst"; chown "$u:$u" "$inst" 2>/dev/null || true
 log "Simes e-imza: otomatik kurulum $u olarak..."
-run_as_user "$u" bash -c "cd '$(dirname "$inst")' && './$(basename "$inst")' -q" || warn "Simes e-imza kurulumu hata kodu dondurdu"
+run_as_user "$u" bash -c "cd '$(dirname "$inst")' && './$(basename "$inst")' -q" || warn "Simes e-imza kurulumu hata kodu döndürdü"
 return 0
 }
 # --------------------------------------------------------------------------
@@ -610,9 +720,9 @@ return 0
 # --------------------------------------------------------------------------
 mode_status() {
 case "$MODE" in
-check) case "$1" in 0) printf 'onarili\n' ;; 1) printf 'onarim-gerekli\n' ;; *) printf 'erisilemedi\n' ;; esac ;;
-verify) case "$1" in 0) printf 'okuyucu-var\n' ;; 1) printf 'okuyucu-yok\n' ;; *) printf 'erisilemedi\n' ;; esac ;;
-*) [ "$1" -eq 0 ] && printf 'uygulandi\n' || printf 'erisilemedi\n' ;;
+check) case "$1" in 0) printf 'onarılı\n' ;; 1) printf 'onarım-gerekli\n' ;; *) printf 'erişilemedi\n' ;; esac ;;
+verify) case "$1" in 0) printf 'okuyucu-var\n' ;; 1) printf 'okuyucu-yok\n' ;; *) printf 'erişilemedi\n' ;; esac ;;
+*) [ "$1" -eq 0 ] && printf 'uygulandı\n' || printf 'erişilemedi\n' ;;
 esac
 }
 do_all() {
@@ -623,7 +733,7 @@ command -v "$getent" >/dev/null 2>&1 || { err "getent yok"; return 2; }
 if [ "$NO_DEPS" -eq 0 ] && [ "$MODE" != "revert" ]; then
 if [ "$MODE" = "check" ]; then
 local astate; astate="$(akia_state)"
-[ "$astate" = "ok" ] && printf 'akia: kurulu ve saglam\n' || { printf 'akia: %s -> onarim gerekli\n' "$(akia_state_text "$astate")"; worst=1; }
+[ "$astate" = "ok" ] && printf 'akia: kurulu ve sağlam\n' || { printf 'akia: %s -> sistem katmanı gerekli\n' "$(akia_state_text "$astate")"; worst=1; }
 else
 ensure_system_layer || worst=2
 fi
@@ -636,7 +746,7 @@ case "$shell" in */nologin|*/false|'') continue ;; esac
 if command -v timeout >/dev/null 2>&1; then timeout 5 test -d "$home"; else test -d "$home"; fi
 [ $? -ne 0 ] && { printf '%s: erisilemedi\n' "$user"; worst=2; continue; }
 discovered="$(HOME="$home" find_installs "$home" 2>/dev/null)"; dst=$?
-[ "$dst" -eq 3 ] && { printf '%s: erisilemedi\n' "$user"; worst=2; continue; }
+[ "$dst" -eq 3 ] && { printf '%s: erişilemedi\n' "$user"; worst=2; continue; }
 [ -z "$discovered" ] && { printf '%s: kurulum-yok\n' "$user"; continue; }
 while IFS= read -r d; do
 [ -n "$d" ] || continue
@@ -656,7 +766,7 @@ done < <("$getent" passwd)
 return "$worst"
 }
 # --------------------------------------------------------------------------
-# Ana akis (VARSAYILAN = kurulum, ev dizininde SimesIstemci yoksa)
+# Ana akış
 # --------------------------------------------------------------------------
 run_for() {
 local d="$1"
@@ -667,27 +777,29 @@ revert) do_revert "$d" ;;
 verify) do_verify "$d" ;;
 esac
 }
+if [ "$MODE" = "system" ]; then system_setup; exit $?; fi
 if [ "$ALL" -eq 1 ]; then do_all; exit $?; fi
 if [ -n "$TARGET_DIR" ]; then
-is_install "$TARGET_DIR" || { err "SiMES kurulumu bulunamadi: $TARGET_DIR"; exit 2; }
+is_install "$TARGET_DIR" || { err "SiMES kurulumu bulunamadı: $TARGET_DIR"; exit 2; }
 run_for "$TARGET_DIR"; exit $?
 fi
+# Ilk calistirma: kullanici ev dizininde SimesIstemci yoksa varsayılan kurulum.
 if [ "$MODE" = "repair" ]; then
 CHOME="$(calling_home)"
 if [ ! -d "$CHOME/SimesIstemci" ]; then
-log "Simes e-imza: $CHOME/SimesIstemci bulunamadi; varsayilan kurulum baslatiliyor."
+log "Simes e-imza: $CHOME/SimesIstemci bulunamadı; varsayılan kurulum başlatılıyor."
 install_simes_bootstrap || exit 2
 fi
 fi
 discovered="$(find_installs)"; dst=$?
-[ "$dst" -eq 3 ] && { err "arama zaman asimi"; exit 2; }
+[ "$dst" -eq 3 ] && { err "arama zaman aşımı"; exit 2; }
 if [ "$dst" -ne 0 ] || [ -z "$discovered" ]; then
 if [ "$BOOTSTRAP" -eq 1 ] || [ "$MODE" = "repair" ]; then
 install_simes_bootstrap || exit 2
 discovered="$(find_installs)"; dst=$?
 fi
 if [ "$dst" -ne 0 ] || [ -z "$discovered" ]; then
-err "Simes e-imza kurulumu bulunamadi."
+err "Simes e-imza kurulumu bulunamadı."
 err "Kurmak icin: $0 --install"
 exit 2
 fi
@@ -698,13 +810,18 @@ rc=0
 for d in "${INSTALLS[@]}"; do
 owner="$(install_owner "$d")"
 if [ "$(id -u)" -ne 0 ] && [ "$owner" != "$(id -un)" ] && { [ "$MODE" = "repair" ] || [ "$MODE" = "revert" ]; }; then
-log "$d: sahibi $owner - root ile calistirin (atlandi)"
+log "$d: sahibi $owner - root ile çalıştırın (atlandı)"
 rc=1; continue
 fi
 run_for "$d"; st=$?
 [ "$st" -eq 2 ] && exit 2
 [ "$st" -eq 1 ] && rc=1
 done
+if [ -n "$SYSTEM_MISSING" ]; then
+warn "Kullanıcı katmanı tamamlandı; sistem katmanı eksik: $SYSTEM_MISSING"
+warn "Yönetici bu makinede BİR KEZ bu komutla çalıştırmalı: sudo $0 --system-setup"
+[ "$rc" -eq 0 ] && rc=1
+fi
 exit "$rc"
 #@@EMBED-AGENT-BEGIN@@
 #UEsDBBQACAgIAKpEZV0AAAAAAAAAAAAAAAAJAAQATUVUQS1JTkYv/soAAAMAUEsHCAAAAAACAAAA
