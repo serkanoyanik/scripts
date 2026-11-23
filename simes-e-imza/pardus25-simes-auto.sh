@@ -6,7 +6,7 @@
 # Ev dizininde SimesIstemci yoksa VARSAYILAN eylem = kurulum.
 set -u
 umask 022
-VERSION="3.2.0-4"
+VERSION="3.2.0-5"
 MARKER="# simes-pcsc-fix: Pardus 25 libpcsclite.so.1 uyumlulugu - kaldirmak icin: simes-pcsc-fix --revert"
 PROP_PREFIX="-Dsun.security.smartcardio.library="
 PROP_KEY="sun.security.smartcardio.library"
@@ -29,6 +29,8 @@ BOOTSTRAP=0
 SYSTEM_LAYER_DONE=0
 SYSTEM_MISSING=""
 SYSTEM_STRICT="${SIMES_REQUIRE_SYSTEM:-0}"
+PROGRESS_MODE="${SIMES_PROGRESS:-simple}"
+PROGRESS_STEP="${SIMES_PROGRESS_STEP:-5}"
 log()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 err()  { printf '%s\n' "$*" >&2; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -47,6 +49,9 @@ Kullanim: $n [SECENEK]
 --no-deps         akia/pcscd kontrolünü atla
 --quiet           Yalnızca hata bas
 --version         Sürüm
+--progress=KIP    İlerleme kipi: bar | simple | none (varsayılan: bar)
+--simple-progress Sadece yuzde + rakam, yeni satırlı (gömülü terminal)
+--no-progress     Ilerleme gösterme
 --help            Yardım komutları
 
 Katmanlar:
@@ -72,6 +77,10 @@ case "$1" in
 --all)          ALL=1 ;;
 --no-deps)      NO_DEPS=1 ;;
 --quiet)        QUIET=1 ;;
+--progress=*)      PROGRESS_MODE="${1#*=}" ;;
+--simple-progress) PROGRESS_MODE="simple" ;;
+--no-progress)     PROGRESS_MODE="none" ;;
+--bar-progress)    PROGRESS_MODE="bar" ;;
 --version) printf '%s %s\n' "${0##*/}" "$VERSION"; exit 0 ;;
 --help|-h) usage; exit 0 ;;
 --dir)
@@ -615,105 +624,147 @@ sleep 5
 done
 return 0
 }
+progress_init() {
+    case "$PROGRESS_MODE" in bar|simple|none) ;; *) PROGRESS_MODE="simple" ;; esac
+    if [ "$PROGRESS_MODE" = "bar" ]; then
+        if [ ! -t 1 ]; then
+            PROGRESS_MODE="simple"
+        else
+            case "${TERM:-}" in
+                dumb|unknown|"") PROGRESS_MODE="simple" ;;
+            esac
+        fi
+    fi
+    return 0
+}
 install_simes_bootstrap() {
-local u uh url zip dl fsize inst rc total cur pct speed eta bar filled i
-local t0 t1 b0 b1 dt dpid hc ht hs cols barw resume DL_LOG
-u="$(id -un)"
-if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then u="$SUDO_USER"; fi
-uh="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"; [ -z "$uh" ] && uh="$HOME"
-url="$(detect_simes_url)"; [ -z "$url" ] && url="$DEFAULT_SIMES_URL"
-log "Simes e-imza: guncel surum $url"
-dl="$uh/SimesKurulum"
-run_as_user "$u" mkdir -p "$dl" || { err "klasor oluşturulamadı: $dl"; return 2; }
-zip="$dl/$(basename "$url")"
-ensure_unzip || return 2
-ensure_downloader || return 2
-wait_for_auth "$url" || return 2
-resume=0
-if [ -s "$zip" ]; then
-if zip_ok "$zip"; then
-log "Simes e-imza: mevcut sağlam arşiv kullanılacak: $zip"; resume=2
-elif is_zip_file "$zip"; then
-warn "Simes e-imza: yarım kalmış arşiv; kaldığı yerden devam edilecek."
-resume=1
-else
-warn "Simes e-imza: bozuk/HTML arşiv siliniyor."
-rm -f -- "$zip"; resume=0
-fi
-fi
-if [ "$resume" != "2" ]; then
-if command -v curl >/dev/null 2>&1; then
-total="$(curl -sIL --connect-timeout 10 --max-time 15 "$url" 2>/dev/null | awk 'tolower($1)=="content-length:"{v=$2} END{gsub(/\r/,"",v); print v+0}')"
-else
-total="$(wget --spider -S "$url" 2>&1 | awk 'tolower($1)=="content-length:"{v=$2} END{gsub(/\r/,"",v); print v+0}')"
-fi
-[ -z "$total" ] && total=0
-DL_LOG="$(mktemp "${TMPDIR:-/tmp}/simes-dl.XXXXXX")" || DL_LOG=/tmp/simes-dl.log
-log "Simes e-imza: indiriliyor... "
-if command -v wget >/dev/null 2>&1; then
-run_as_user "$u" wget -c --tries=2 --timeout=30 --read-timeout=120 -O "$zip" "$url" >"$DL_LOG" 2>&1 &
-else
-run_as_user "$u" curl -C - -fL --connect-timeout 10 --retry 2 -o "$zip" "$url" >"$DL_LOG" 2>&1 &
-fi
-dpid=$!
-cols=$(tput cols 2>/dev/null || echo 80)
-case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
-[ "$cols" -lt 40 ] && cols=40
-barw=$(( cols - 46 )); [ "$barw" -lt 8 ] && barw=8; [ "$barw" -gt 40 ] && barw=40
-t0=$(date +%s); b0=$(stat -c %s "$zip" 2>/dev/null || echo 0)
-while kill -0 "$dpid" 2>/dev/null; do
-sleep 0.2
-cur=$(stat -c %s "$zip" 2>/dev/null || echo 0)
-t1=$(date +%s); b1=$cur
-dt=$((t1 - t0)); [ "$dt" -le 0 ] && dt=1
-speed=$(( (b1 - b0) / dt ))
-hc=$(numfmt --to=iec "$cur" 2>/dev/null || echo "${cur}B")
-hs=$(numfmt --to=iec "$speed" 2>/dev/null || echo "${speed}B")
-if [ -t 1 ]; then
-if [ "$total" -gt 0 ]; then
-pct=$(( cur * 100 / total )); [ "$pct" -gt 100 ] && pct=100
-filled=$(( pct * barw / 100 )); bar=""; i=0
-while [ "$i" -lt "$barw" ]; do
-if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar} "; fi
-i=$((i+1))
-done
-ht=$(numfmt --to=iec "$total" 2>/dev/null || echo "${total}B")
-if [ "$speed" -gt 0 ]; then eta=$(( (total - cur) / speed )); else eta=0; fi
-printf '\rSimes e-imza: %3d%%|%s| %s/%s %s/s eta %ss\033[K' "$pct" "$bar" "$hc" "$ht" "$hs" "$eta"
-else
-printf '\rSimes e-imza: indiriliyor... %s %s/s\033[K' "$hc" "$hs"
-fi
-fi
-t0=$t1; b0=$b1
-done
-wait "$dpid"; rc=$?
-[ -t 1 ] && printf '\n'
-fsize=$(stat -c %s "$zip" 2>/dev/null || echo 0)
-if [ "$rc" -ne 0 ] || ! zip_ok "$zip"; then
-err "Simes e-imza: indirme başarısız/eksik ($fsize bayt, rc=$rc)."
-err "--- indirme gunlugu (son 15 satir) ---"
-tail -n 15 "$DL_LOG" >&2 || true
-err "Çözüm: zip'i tarayıcıdan indirip şu yola kopyalayın: $zip"
-rm -f "$DL_LOG"
-return 2
-fi
-rm -f "$DL_LOG"
-log "Simes e-imza: indirme tamamlandı ($(numfmt --to=iec "$fsize" 2>/dev/null || echo "$fsize B"))."
-fi
-if zip_ok "$zip"; then
-run_as_user "$u" bash -c "cd '$dl' && unzip -o -q '$(basename "$zip")'" || { err "çıkarma başarısız"; return 2; }
-inst="$(find "$dl" -maxdepth 2 -type f -name '*.sh' 2>/dev/null | head -n1)"
-elif is_sh_file "$zip"; then
-inst="$zip"
-else
-err "Simes e-imza: arşiv geçersiz (zip veya kurulum betiği değil)."
-return 2
-fi
-[ -z "$inst" ] && { err "kurulum scripti bulunamadı"; return 2; }
-chmod +x "$inst"; chown "$u:$u" "$inst" 2>/dev/null || true
-log "Simes e-imza: otomatik kurulum $u olarak..."
-run_as_user "$u" bash -c "cd '$(dirname "$inst")' && './$(basename "$inst")' -q" || warn "Simes e-imza kurulumu hata kodu döndürdü"
-return 0
+    local u uh url zip dl fsize inst rc total cur pct speed eta bar filled i
+    local t0 t1 b0 b1 dt dpid hc ht hs cols barw resume DL_LOG
+    local poll next_pct last_rep
+    u="$(id -un)"
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then u="$SUDO_USER"; fi
+    uh="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"; [ -z "$uh" ] && uh="$HOME"
+    url="$(detect_simes_url)"; [ -z "$url" ] && url="$DEFAULT_SIMES_URL"
+    log "Simes e-imza: güncel sürüm $url"
+    dl="$uh/SimesKurulum"
+    run_as_user "$u" mkdir -p "$dl" || { err "klasör oluşturulamadı: $dl"; return 2; }
+    zip="$dl/$(basename "$url")"
+    ensure_unzip || return 2
+    ensure_downloader || return 2
+    wait_for_auth "$url" || return 2
+    resume=0
+    if [ -s "$zip" ]; then
+        if zip_ok "$zip"; then
+            log "Simes e-imza: mevcut sağlam arşiv kullanılacak: $zip"; resume=2
+        elif is_zip_file "$zip"; then
+            warn "Simes e-imza: yarım kalmış arşiv; kaldığı yerden devam edilecek."
+            resume=1
+        else
+            warn "Simes e-imza: bozuk/HTML arşiv siliniyor."
+            rm -f -- "$zip"; resume=0
+        fi
+    fi
+    if [ "$resume" != "2" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            total="$(curl -sIL --connect-timeout 10 --max-time 15 "$url" 2>/dev/null | awk 'tolower($1)=="content-length:"{v=$2} END{gsub(/\r/,"",v); print v+0}')"
+        else
+            total="$(wget --spider -S "$url" 2>&1 | awk 'tolower($1)=="content-length:"{v=$2} END{gsub(/\r/,"",v); print v+0}')"
+        fi
+        [ -z "$total" ] && total=0
+        DL_LOG="$(mktemp "${TMPDIR:-/tmp}/simes-dl.XXXXXX")" || DL_LOG=/tmp/simes-dl.log
+        progress_init
+        log "Simes e-imza: indiriliyor... (gösterim kipi: $PROGRESS_MODE)"
+        if command -v wget >/dev/null 2>&1; then
+            run_as_user "$u" wget -c --tries=2 --timeout=30 --read-timeout=120 -O "$zip" "$url" >"$DL_LOG" 2>&1 &
+        else
+            run_as_user "$u" curl -C - -fL --connect-timeout 10 --retry 2 -o "$zip" "$url" >"$DL_LOG" 2>&1 &
+        fi
+        dpid=$!
+        cols=$(tput cols 2>/dev/null || echo 80)
+        case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+        [ "$cols" -lt 40 ] && cols=40
+        barw=$(( cols - 46 )); [ "$barw" -lt 8 ] && barw=8; [ "$barw" -gt 40 ] && barw=40
+        poll=0.2; [ "$PROGRESS_MODE" != "bar" ] && poll=1
+        next_pct=0; last_rep=$(date +%s)
+        t0=$(date +%s); b0=$(stat -c %s "$zip" 2>/dev/null || echo 0)
+        while kill -0 "$dpid" 2>/dev/null; do
+            sleep "$poll"
+            cur=$(stat -c %s "$zip" 2>/dev/null || echo 0)
+            t1=$(date +%s); b1=$cur
+            dt=$((t1 - t0)); [ "$dt" -le 0 ] && dt=1
+            speed=$(( (b1 - b0) / dt ))
+            hc=$(numfmt --to=iec "$cur" 2>/dev/null || echo "${cur}B")
+            hs=$(numfmt --to=iec "$speed" 2>/dev/null || echo "${speed}B")
+            if [ "$total" -gt 0 ]; then
+                pct=$(( cur * 100 / total )); [ "$pct" -gt 100 ] && pct=100
+            else
+                pct=0
+            fi
+            case "$PROGRESS_MODE" in
+            bar)
+                if [ "$total" -gt 0 ]; then
+                    filled=$(( pct * barw / 100 )); bar=""; i=0
+                    while [ "$i" -lt "$barw" ]; do
+                        if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar} "; fi
+                        i=$((i+1))
+                    done
+                    ht=$(numfmt --to=iec "$total" 2>/dev/null || echo "${total}B")
+                    if [ "$speed" -gt 0 ]; then eta=$(( (total - cur) / speed )); else eta=0; fi
+                    printf '\rSimes e-imza: %3d%%|%s| %s/%s %s/s eta %ss\033[K' "$pct" "$bar" "$hc" "$ht" "$hs" "$eta"
+                else
+                    printf '\rSimes e-imza: indiriliyor... %s %s/s\033[K' "$hc" "$hs"
+                fi
+                ;;
+            simple)
+                if [ "$total" -gt 0 ]; then
+                    if [ "$pct" -ge "$next_pct" ]; then
+                        ht=$(numfmt --to=iec "$total" 2>/dev/null || echo "${total}B")
+                        printf 'Simes e-imza: %3d%% - %s/%s\n' "$pct" "$hc" "$ht"
+                        next_pct=$(( pct + PROGRESS_STEP ))
+                    fi
+                else
+                    if [ $(( t1 - last_rep )) -ge 5 ]; then
+                        printf 'Simes e-imza: %s indirildi\n' "$hc"
+                        last_rep=$t1
+                    fi
+                fi
+                ;;
+            none) : ;;
+            esac
+            t0=$t1; b0=$b1
+        done
+        wait "$dpid"; rc=$?
+        [ "$PROGRESS_MODE" = "bar" ] && printf '\n'
+        fsize=$(stat -c %s "$zip" 2>/dev/null || echo 0)
+        if [ "$rc" -ne 0 ] || ! zip_ok "$zip"; then
+            err "Simes e-imza: indirme başarısız/eksik ($fsize bayt, rc=$rc)."
+            err "--- indirme gunlugu (son 15 satir) ---"
+            tail -n 15 "$DL_LOG" >&2 || true
+            err "Cozum: zip'i tarayıcıdan indirip şu yola kopyalayın: $zip"
+            rm -f "$DL_LOG"
+            return 2
+        fi
+        rm -f "$DL_LOG"
+        if [ "$PROGRESS_MODE" = "simple" ] && [ "$total" -gt 0 ]; then
+            ht=$(numfmt --to=iec "$total" 2>/dev/null || echo "${total}B")
+            printf 'Simes e-imza: 100%% - %s/%s\n' "$ht" "$ht"
+        fi
+        log "Simes e-imza: indirme tamamlandı ($(numfmt --to=iec "$fsize" 2>/dev/null || echo "$fsize B"))."
+    fi
+    if zip_ok "$zip"; then
+        run_as_user "$u" bash -c "cd '$dl' && unzip -o -q '$(basename "$zip")'" || { err "çıkarma başarısız"; return 2; }
+        inst="$(find "$dl" -maxdepth 2 -type f -name '*.sh' 2>/dev/null | head -n1)"
+    elif is_sh_file "$zip"; then
+        inst="$zip"
+    else
+        err "Simes e-imza: arşiv geçersiz (zip veya kurulum betiği değil)."
+        return 2
+    fi
+    [ -z "$inst" ] && { err "kurulum scripti bulunamadı"; return 2; }
+    chmod +x "$inst"; chown "$u:$u" "$inst" 2>/dev/null || true
+    log "Simes e-imza: otomatik kurulum $u olarak..."
+    run_as_user "$u" bash -c "cd '$(dirname "$inst")' && './$(basename "$inst")' -q" || warn "Simes e-imza kurulumu hata kodu döndürdü"
+    return 0
 }
 # --------------------------------------------------------------------------
 # Root turu
