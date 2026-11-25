@@ -877,6 +877,25 @@ fi
 zip_ok "$zip" || is_sh_file "$zip" || { err "Arşiv doğrulanamadı"; return 2; }
 return 0
 }
+
+stop_simes_processes() {
+    local target_class="install4j.tr.gov.tubitak.bilgem.simes.agent.SimesClientApplication"
+    if pgrep -f "$target_class" >/dev/null 2>&1 || pgrep -f "SimesAgent" >/dev/null 2>&1; then
+        log "Arka planda çalışan SİMES süreçleri tespit edildi, sonlandırılıyor..."
+        pkill -TERM -f "$target_class" 2>/dev/null || true
+        pkill -TERM -f "SimesAgent" 2>/dev/null || true
+        sleep 2
+        
+        if pgrep -f "$target_class" >/dev/null 2>&1 || pgrep -f "SimesAgent" >/dev/null 2>&1; then
+            warn "Bazı Simes süreçleri inatçı, zorla kapatılıyor (SIGKILL)..."
+            pkill -9 -f "$target_class" 2>/dev/null || true
+            pkill -9 -f "SimesAgent" 2>/dev/null || true
+            sleep 1
+        fi
+        log "Simes süreçleri tamamen temizlendi."
+    fi
+}
+
 install_from_archive() {
 local u="$SIMES_USER" dl="$SIMES_DL" zip="$SIMES_ZIP" inst
 if zip_ok "$zip"; then
@@ -888,11 +907,19 @@ else err "Arşiv geçersiz"; return 2; fi
 chmod +x "$inst"; chown "$u:$u" "$inst" 2>/dev/null || true
 log "Simes e-imza: otomatik kurulum $u olarak..."
 run_as_user "$u" bash -c "cd '$(dirname "$inst")' && './$(basename "$inst")' -q" || warn "Kurulum hata kodu döndürdü"
+
+# Kurulum sihirbazının (-q modda) otomatik başlattığı Simes sürecini tespit edip temizleyelim
+stop_simes_processes
+
 return 0
 }
+
 remove_old_install() {
 local d="$1" owner rc
 owner="$(install_owner "$d")"; [ -n "$owner" ] || owner="$(id -un)"
+
+stop_simes_processes
+
 if [ -x "$d/uninstall" ]; then
 log "Eski sürüm kaldırılıyor: $d/uninstall -q ($owner)"
 if command -v timeout >/dev/null 2>&1; then
