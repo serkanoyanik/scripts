@@ -3,6 +3,7 @@
 Kullanım:
 
 chmod +x pardus25-simes-auto.sh
+
 ./pardus25-simes-auto.sh
 
 Pardus 25 üzerinde **SiMES e-imza istemcisinin (3.2.0) akıllı kart okuyucuyu
