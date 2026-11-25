@@ -1,6 +1,11 @@
 # pardus25-simes-auto 
 
-Pardus 25 üzerinde **SiMES e-imza istemcisinin (2.6.7 / 3.2.0) akıllı kart okuyucuyu
+Kullanım:
+
+chmod +x pardus25-simes-auto.sh
+./pardus25-simes-auto.sh
+
+Pardus 25 üzerinde **SiMES e-imza istemcisinin (3.2.0) akıllı kart okuyucuyu
 görememesi** sorununu onaran betik.
 
 ## Ne işe yarar?
